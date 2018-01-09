@@ -1,13 +1,16 @@
 (ns leiningen.modules
-  (:require [leiningen.core.project :as prj]
-            [leiningen.core.main :as main]
-            [leiningen.core.eval :as eval]
-            [leiningen.core.utils :as utils]
-            [clojure.java.io :as io]
-            [clojure.string :as s])
-  (:use [lein-modules.inheritance :only (inherit)]
-        [lein-modules.common      :only (parent with-profiles read-project)]
-        [lein-modules.compression :only (compressed-profiles)]))
+  (:require [clojure.java.io :as io]
+            [clojure.string :as s]
+            [lein-modules
+             [inheritance :refer [inherit]]
+             [common :refer [parent with-profiles read-project]]
+             [compression :refer [compressed-profiles]]]
+            [leiningen.core
+             [project :as prj]
+             [main :as main]
+             [eval :as eval]
+             [utils :as utils]])
+  (:import [java.io File PushbackReader]))
 
 (defn child?
   "Return true if child is an immediate descendant of project"
@@ -129,53 +132,69 @@
 (defn modules
   "Run a task for all related projects in dependency order.
 
-Any task (along with any arguments) will be run in this project and
-then each of this project's child modules. For example:
+  Any task (along with any arguments) will be run in this project and
+  then each of this project's child modules. For example:
 
   $ lein modules install
   $ lein modules deps :tree
   $ lein modules do clean, test
   $ lein modules analias
 
-You can create 'checkout dependencies' for all interdependent modules
-by including the :checkouts flag:
+  You can create 'checkout dependencies' for all interdependent modules
+  by including the :checkouts flag:
 
   $ lein modules :checkouts
 
-And you can limit which modules run the task with the :dirs option:
+  And you can limit which modules run the task with the :dirs option:
 
   $ lein modules :dirs core,web install
 
-Delimited by either comma or colon, this list of relative paths
-will override the [:modules :dirs] config in project.clj"
+  Delimited by either comma or colon, this list of relative paths
+  will override the [:modules :dirs] config in project.clj"
   [project & args]
+  (println "DEBUG]" args)
   (condp = (first args)
     ":checkouts" (do
                    (checkout-dependencies project)
                    (apply modules project (remove #{":checkouts"} args)))
-    ":dirs" (let [dirs (s/split (second args) #"[:,]")]
-              (apply modules
-                (-> project
-                  (assoc-in [:modules :dirs] dirs)
-                  (vary-meta assoc-in [:without-profiles :modules :dirs] dirs))
-                (drop 2 args)))
-    nil (dump-modules (ordered-builds project))
-    (let [modules (ordered-builds project)
-          profiles (compressed-profiles project)
-          args (cli-with-profiles profiles args)
-          subprocess (get-in project [:modules :subprocess]
-                       (or (System/getenv "LEIN_CMD")
-                         (if (= :windows (utils/get-os)) "lein.bat" "lein")))]
+    ":dirs"      (let [dirs (s/split (second args) #"[:,]")]
+                   (apply modules
+                          (-> project
+                              (assoc-in [:modules :dirs] dirs)
+                              (vary-meta assoc-in [:without-profiles :modules :dirs] dirs))
+                          (drop 2 args)))
+    ":parent"    (let [[_ parentf next-task & args] args
+                       parent                       (-> (io/file parentf)
+                                                        (io/reader)
+                                                        (PushbackReader.)
+                                                        read)
+                       project                      (assoc-in project [:modules :parent] parent)]
+                   (main/apply-task next-task project args)) 
+    nil          (dump-modules (ordered-builds project))
+    (let [modules             (ordered-builds project)
+          profiles            (compressed-profiles project)
+          args                (cli-with-profiles profiles args)
+          subprocess          (get-in project [:modules :subprocess]
+                                      (or (System/getenv "LEIN_CMD")
+                                          (if (= :windows (utils/get-os)) "lein.bat" "lein")))
+          parent-project-file (File/createTempFile "project" ".edn")]
+      (spit parent-project-file (pr-str project))
       (dump-modules modules)
-      (doseq [project modules]
+
+      (doseq [subproject modules]
+        ;; Print the banner. Note that the printed version may be wrong due to plugins not having run yet.
         (println "------------------------------------------------------------------------")
-        (println " Building" (:name project) (:version project) (dump-profiles args))
+        (println " Building" (:name subproject) (:version subproject) (dump-profiles args))
         (println "------------------------------------------------------------------------")
-        (if-let [cmd (get-in project [:modules :subprocess] subprocess)]
-          (binding [eval/*dir* (:root project)]
-            (let [exit-code (apply eval/sh (cons cmd args))]
+
+        (if-let [cmd (get-in subproject [:modules :subprocess] subprocess)]
+          ;; If we're using subprocesses
+          (binding [eval/*dir* (:root subproject)]
+            (let [exit-code (apply eval/sh cmd "modules" ":parent" (.getPath parent-project-file) args)]
               (when (pos? exit-code)
                 (throw (ex-info "Subprocess failed" {:exit-code exit-code})))))
-          (let [project (prj/init-project project)
-                task (main/lookup-alias (first args) project)]
-            (main/apply-task task project (rest args))))))))
+
+          ;; Otherwise try to run the task in this process
+          (let [subproject (prj/init-project subproject)
+                task       (main/lookup-alias (first args) subproject)]
+            (main/apply-task task subproject (rest args))))))))
