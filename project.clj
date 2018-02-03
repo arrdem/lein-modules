@@ -6,6 +6,7 @@
   :eval-in-leiningen true
   :aliases {"all" ["do" "clean," "test," "install"]}
   :signing {:gpg-key "92439EF5"}
+  :dependencies [[me.arrdem/cuddlefish "0.1.0"]]
   :plugins [[lein-file-replace "0.1.0"]]
   :deploy-repositories {"releases" :clojars}
   :release-tasks
